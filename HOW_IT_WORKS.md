@@ -37,11 +37,11 @@ usually comes next?"**
 It learns this by sliding a 3-word window over every message:
 
 ```
-"i like strong coffee" produces three triples:
+"i like strong black coffee" produces three triples:
 
-    (i, like)     →  strong
-    (like, strong) →  coffee
-    (strong, coffee) →  ...
+    (i, like)       →  strong
+    (like, strong)  →  black
+    (strong, black) →  coffee
 ```
 
 Each observation is stored as:

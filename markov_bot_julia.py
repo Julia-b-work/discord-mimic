@@ -1,23 +1,29 @@
-from dotenv import load_dotenv
-import os
-import json
-import asyncio
-import random
-from typing import Literal
-import discord
-from discord.ext import commands
+from dotenv import load_dotenv  # reads secrets.env into environment variables
+import os  # getenv
+import json  # save/load memory.json
+import asyncio  # concurrent channel scanning + progress ticker
+import random  # all the "personality" randomness
+from typing import Literal  # restricts the /mode argument to fixed choices
+import discord  # the core library
+from discord.ext import commands  # commands.Bot and command decorators
 
+# Load DISCORD_TOKEN from secrets.env (kept out of git).
 load_dotenv("secrets.env")
 
 token = os.getenv("DISCORD_TOKEN")
 
+# Fail loudly and immediately if the token is missing.
 if token is None:
-    print("ERROR: DISCORD_TOKEN is not set. Create a .env file with the token.")
+    print("ERROR: DISCORD_TOKEN is not set. Create a secrets.env file with the token.")
     raise SystemExit(1)
 
+# Intents declare which events we want to receive. message_content is the one
+# that lets us actually read message text (needed to learn how people talk).
 intents = discord.Intents.default()
 intents.message_content = True
 
+# command_prefix is required by commands.Bot even though we only use slash
+# commands; "!" is a harmless placeholder.
 client = commands.Bot(command_prefix="!", intents=intents)
 
 # Learned state, reloaded from disk in on_ready.
@@ -100,11 +106,14 @@ def load_users():
     return loaded, data.get("current_user_id"), data.get("mode", "user"), loaded_server
 
 
+# Fires once when the bot finishes connecting to Discord.
 @client.event
 async def on_ready():
     global users, current_user_id, mode, server
     print(f"logged in as {client.user}")
+    # Restore everything learned in previous sessions from memory.json.
     users, current_user_id, mode, server = load_users()
+    # Push the slash-command definitions to Discord so they appear in the UI.
     await client.tree.sync()
 
 
@@ -463,6 +472,7 @@ class ChannelPicker(discord.ui.View):
             await run_mimic(interaction, self.users, channels)
 
 
+# /mimic @user [@user2 @user3 @user4] — learn up to four people at once.
 @client.tree.command(name="mimic", description="I'm about to become someone!!!")
 async def mimic(
     interaction: discord.Interaction,
@@ -471,12 +481,15 @@ async def mimic(
     user3: discord.Member = None,
     user4: discord.Member = None,
 ):
+    # Slash commands only make sense inside a server (we need guild channels).
     if interaction.guild is None:
         await interaction.response.send_message("This command only works in a server.")
         return
 
+    # Drop the optional slots the user left empty.
     targets = [u for u in (user, user2, user3, user4) if u is not None]
 
+    # Ask which channels to scan; the ChannelPicker view does the actual work.
     names = ", ".join(u.mention for u in targets)
     await interaction.response.send_message(
         f"Which channels should I read to imitate {names}?",
@@ -484,18 +497,21 @@ async def mimic(
     )
 
 
+# /servermimic — learn everyone at once and become the whole server.
 @client.tree.command(name="servermimic", description="Become the whole server")
 async def servermimic(interaction: discord.Interaction):
     if interaction.guild is None:
         await interaction.response.send_message("This command only works in a server.")
         return
 
+    # server_mode=True makes the picker route to run_server_mimic.
     await interaction.response.send_message(
         "Which channels should I read to imitate this server?",
         view=ChannelPicker([], server_mode=True),
     )
 
 
+# /mode user|server — choose who /speak and spontaneous replies talk as.
 @client.tree.command(name="mode", description="Switch who I talk as")
 async def set_mode(
     interaction: discord.Interaction,
@@ -503,6 +519,7 @@ async def set_mode(
 ):
     global mode
 
+    # Can't switch to server mode if /servermimic has never been run.
     if new_mode == "server" and server is None:
         await interaction.response.send_message(
             "I haven't learned this server yet. Use /servermimic first!"
@@ -510,14 +527,16 @@ async def set_mode(
         return
 
     mode = new_mode
-    save_users()
+    save_users()  # persist the choice so it survives a restart
 
     label = "the whole server" if mode == "server" else "the imitated user"
     await interaction.response.send_message(f"Switched! Now I talk as {label}.")
 
 
+# /speak — produce one sentence on demand, obeying the current mode.
 @client.tree.command(name="speak", description="Speak as the imitated user")
 async def speak(interaction: discord.Interaction):
+    # Server mode: talk as the combined server personality.
     if mode == "server":
         if server is None:
             await interaction.response.send_message(
@@ -525,6 +544,7 @@ async def speak(interaction: discord.Interaction):
             )
             return
 
+        # 30% chance to reply with a saved image/GIF instead of text.
         media = server.get("media", [])
         if media and random.random() < 0.3:
             await interaction.response.send_message(random.choice(media))
@@ -533,6 +553,7 @@ async def speak(interaction: discord.Interaction):
         await interaction.response.send_message(generate_sentence(server["chain"]))
         return
 
+    # User mode: talk as the most recently /mimic'd user.
     if current_user_id is None or current_user_id not in users:
         await interaction.response.send_message(
             "I'm not pretending to be anyone yet. Use /mimic first!"
@@ -541,6 +562,7 @@ async def speak(interaction: discord.Interaction):
 
     sentence = generate_sentence(users[current_user_id]["chain"])
 
+    # Same 30% media chance as above, drawn from the user's own posts.
     media = users[current_user_id].get("media", [])
     if media and random.random() < 0.3:
         await interaction.response.send_message(random.choice(media))
@@ -549,6 +571,8 @@ async def speak(interaction: discord.Interaction):
     await interaction.response.send_message(sentence)
 
 
+# /users — list everyone (and the server) the bot has learned, with a marker
+# on whoever is currently active.
 @client.tree.command(name="users", description="Who have I been spying on?")
 async def list_users(interaction: discord.Interaction):
     if not users and server is None:
@@ -559,9 +583,11 @@ async def list_users(interaction: discord.Interaction):
 
     lines = []
     for uid, info in users.items():
+        # The " *" suffix marks the user who is active in "user" mode.
         marker = " *" if (uid == current_user_id and mode == "user") else ""
         lines.append(f"**{info['name']}**{marker}")
 
+    # The server personality is listed separately, marked when in server mode.
     if server is not None:
         server_marker = " *" if mode == "server" else ""
         lines.append(f"**{server['name']}** (server){server_marker}")
@@ -569,6 +595,7 @@ async def list_users(interaction: discord.Interaction):
     await interaction.response.send_message("\n".join(lines))
 
 
+# /converse @user1 @user2 — print five alternating lines between two people.
 @client.tree.command(
     name="converse", description="Simulate a conversation between two users"
 )
@@ -577,6 +604,7 @@ async def converse(
     user1: discord.Member,
     user2: discord.Member,
 ):
+    # Collect whichever participants haven't been /mimic'd yet.
     missing = []
     if str(user1.id) not in users:
         missing.append(user1.mention)
@@ -594,6 +622,7 @@ async def converse(
     name1 = users[str(user1.id)]["name"]
     name2 = users[str(user2.id)]["name"]
 
+    # Five back-and-forth rounds, each line freshly generated.
     lines = []
     for _ in range(5):
         lines.append(f"**{name1}**: {generate_sentence(chain1)}")
@@ -602,14 +631,16 @@ async def converse(
     await interaction.response.send_message("\n".join(lines))
 
 
+# Global safety net for any slash-command error that isn't handled locally.
 @client.tree.error
 async def on_tree_error(interaction: discord.Interaction, error):
-    print(f"ERROR in /{interaction.command.name}: {error!r}")
+    print(f"ERROR in /{getattr(interaction.command, 'name', 'unknown')}: {error!r}")
     try:
         await interaction.followup.send("Something went wrong. Blame the robot, not me.")
     except Exception:
-        pass
+        pass  # followup may already be used; nothing left to do
 
 
+# Only connect to Discord when run directly (not when imported by tests).
 if __name__ == "__main__":
     client.run(token)
