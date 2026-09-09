@@ -26,7 +26,7 @@ intents.message_content = True
 # commands; "!" is a harmless placeholder.
 client = commands.Bot(command_prefix="!", intents=intents)
 
-# Learned state, reloaded from disk in on_ready.
+# Learned state, reloaded from disk in setup_hook.
 users = {}
 current_user_id = None
 
@@ -40,6 +40,9 @@ server = None
 heat = 0
 
 MEMORY_FILE = "memory.json"
+
+# Claude integration for /ask: which model to call, overridable via secrets.env.
+CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-5")
 
 
 # Write the whole in-memory state (users, mode, server) to memory.json.
@@ -70,8 +73,12 @@ def save_users():
             for uid, info in users.items()
         },
     }
-    with open(MEMORY_FILE, "w", encoding="utf-8") as f:
+    # Write to a temp file first, then atomically swap it in. A crash mid-write
+    # therefore can't leave a truncated memory.json that wipes all learned state.
+    tmp_file = MEMORY_FILE + ".tmp"
+    with open(tmp_file, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False)
+    os.replace(tmp_file, MEMORY_FILE)
 
 
 # Read memory.json back. Returns (users, current_user_id, mode, server).
@@ -106,15 +113,24 @@ def load_users():
     return loaded, data.get("current_user_id"), data.get("mode", "user"), loaded_server
 
 
-# Fires once when the bot finishes connecting to Discord.
-@client.event
-async def on_ready():
+# Runs exactly once, after login but before the gateway connects. Unlike
+# on_ready (which re-fires on every reconnect), this is the right place for
+# one-time work like loading memory and syncing slash commands (rate-limited).
+async def setup_hook():
     global users, current_user_id, mode, server
-    print(f"logged in as {client.user}")
     # Restore everything learned in previous sessions from memory.json.
     users, current_user_id, mode, server = load_users()
     # Push the slash-command definitions to Discord so they appear in the UI.
     await client.tree.sync()
+
+
+client.setup_hook = setup_hook
+
+
+# Fires when the bot finishes connecting (and again after any reconnect).
+@client.event
+async def on_ready():
+    print(f"logged in as {client.user}")
 
 
 @client.event
@@ -222,13 +238,11 @@ def generate_sentence(chain, max_words=30):
 _GIF_HOSTS = ("tenor.com", "giphy.com", "media.tenor.com")
 
 
-# Collect image/GIF URLs from a message (direct uploads + embedded links).
+# Collect GIF links from a message. Direct uploads are deliberately skipped:
+# Discord CDN attachment URLs are signed and expire after ~24h, so saving them
+# to memory.json would produce dead links later. Tenor/Giphy links are stable.
 def extract_media(message):
     urls = []
-
-    for attachment in message.attachments:
-        if attachment.content_type and attachment.content_type.startswith("image/"):
-            urls.append(attachment.url)
 
     for word in message.content.split():
         if word.startswith("http") and any(host in word for host in _GIF_HOSTS):
@@ -240,7 +254,10 @@ def extract_media(message):
 # Scan channels, build one chain per target user, store + save, then reply.
 async def run_mimic(interaction, targets, channels):
     # Post an editable "working..." message; updated live during the scan.
-    progress = await interaction.followup.send("Snooping through messages...")
+    # Sent as a normal channel message (not an interaction followup) because
+    # interaction tokens expire after 15 minutes and a full history scan of a
+    # big server can easily take longer than that.
+    progress = await interaction.channel.send("Snooping through messages...")
 
     target_ids = {user.id for user in targets}
     messages_by_user = {user.id: [] for user in targets}
@@ -261,9 +278,10 @@ async def run_mimic(interaction, targets, channels):
                         channel_messages[message.author.id].append(message.content)
                     # Media is collected even from text-less (image-only) posts.
                     channel_media[message.author.id].extend(extract_media(message))
-        except discord.Forbidden:
-            # No "Read Message History" permission: skip this channel, keep going.
-            pass
+        except discord.HTTPException as exc:
+            # Missing "Read Message History" permission (Forbidden), a deleted
+            # channel (NotFound), etc.: skip this channel, keep the others going.
+            print(f"skipping #{channel.name}: {exc!r}")
         return channel_messages, channel_media
 
     # Refreshes the progress message once per second (not per message) to avoid
@@ -340,13 +358,18 @@ async def run_mimic(interaction, targets, channels):
 
     save_users()
 
-    await interaction.followup.send("\n".join(results))
+    # channel.send (not followup) for the same 15-minute-token reason as above;
+    # AllowedMentions.none() so the mentions in the text don't ping anyone.
+    await interaction.channel.send(
+        "\n".join(results), allowed_mentions=discord.AllowedMentions.none()
+    )
 
 
 # Scan channels, merge EVERYONE's messages into one chain, then switch mode.
 # Same overall shape as run_mimic, but there's a single combined personality.
 async def run_server_mimic(interaction, channels):
-    progress = await interaction.followup.send("Snooping through messages...")
+    # channel.send rather than followup: see run_mimic for why (15-minute tokens).
+    progress = await interaction.channel.send("Snooping through messages...")
 
     all_messages = []
     all_media = []
@@ -366,8 +389,8 @@ async def run_server_mimic(interaction, channels):
                 if message.content.strip():
                     channel_messages.append(message.content)
                 channel_media.extend(extract_media(message))
-        except discord.Forbidden:
-            pass
+        except discord.HTTPException as exc:
+            print(f"skipping #{channel.name}: {exc!r}")
         return channel_messages, channel_media
 
     async def progress_loop():
@@ -404,7 +427,7 @@ async def run_server_mimic(interaction, channels):
 
     # Nothing but bots (or nothing at all) -> can't learn the server.
     if not all_messages:
-        await interaction.followup.send(
+        await interaction.channel.send(
             "Couldn't read anyone's messages. Is this server a ghost town?"
         )
         return
@@ -413,7 +436,7 @@ async def run_server_mimic(interaction, channels):
 
     # All messages too short to form any triples.
     if not chain:
-        await interaction.followup.send(
+        await interaction.channel.send(
             "Couldn't learn this server's style (messages too short)."
         )
         return
@@ -428,7 +451,7 @@ async def run_server_mimic(interaction, channels):
     save_users()
 
     sentence = generate_sentence(chain)
-    await interaction.followup.send(f"**{interaction.guild.name}**: {sentence}")
+    await interaction.channel.send(f"**{interaction.guild.name}**: {sentence}")
 
 
 # Multi-select channel dropdown + an "all channels" button.
@@ -451,10 +474,16 @@ class ChannelPicker(discord.ui.View):
         await interaction.response.defer()
 
         # select.values holds lightweight channel objects with no .history();
-        # resolve each to a full TextChannel via the guild lookup.
+        # resolve each to a full TextChannel via the guild lookup. get_channel
+        # returns None for uncached/deleted channels, so drop those rather than
+        # letting one bad pick crash the whole scan.
         channels = [
             interaction.guild.get_channel(channel.id) for channel in select.values
         ]
+        channels = [ch for ch in channels if ch is not None]
+        if not channels:
+            await interaction.followup.send("I couldn't find any of those channels.")
+            return
         if self.server_mode:
             await run_server_mimic(interaction, channels)
         else:
@@ -470,6 +499,18 @@ class ChannelPicker(discord.ui.View):
             await run_server_mimic(interaction, channels)
         else:
             await run_mimic(interaction, self.users, channels)
+
+    # Exceptions inside view callbacks are NOT routed to client.tree.error, so
+    # without this they'd only print a traceback and leave the user with a
+    # "Snooping..." message that never finishes.
+    async def on_error(self, interaction, error, item):
+        print(f"ERROR in ChannelPicker ({item}): {error!r}")
+        try:
+            await interaction.channel.send(
+                "Something went wrong while snooping. Blame the robot, not me."
+            )
+        except Exception:
+            pass
 
 
 # /mimic @user [@user2 @user3 @user4] — learn up to four people at once.
@@ -631,16 +672,83 @@ async def converse(
     await interaction.response.send_message("\n".join(lines))
 
 
+# /ask <question> — have Claude answer in the active persona's voice.
+# Persona style comes from a few Markov samples, so Claude imitates the vibe.
+@client.tree.command(name="ask", description="Ask the active persona anything (Claude)")
+async def ask(interaction: discord.Interaction, question: str):
+    # Resolve the active persona (same logic as /speak).
+    if mode == "server" and server is not None:
+        name, chain = server["name"], server["chain"]
+    elif mode == "user" and current_user_id in users:
+        name, chain = users[current_user_id]["name"], users[current_user_id]["chain"]
+    else:
+        await interaction.response.send_message(
+            "I'm not pretending to be anyone yet. Use /mimic or /servermimic first!"
+        )
+        return
+
+    # The Claude call takes a few seconds; defer so Discord doesn't time out.
+    await interaction.response.defer()
+
+    # Sample the Markov chain a few times to show Claude how this person writes.
+    samples = "\n".join(
+        f"- {generate_sentence(chain)}" for _ in range(3)
+    )
+    system_prompt = (
+        f"You are {name}, a member of this Discord server. "
+        f"Answer in first person, briefly, matching {name}'s tone and vocabulary. "
+        f"Sample messages {name} has written, to copy the style:\n{samples}"
+    )
+
+    # Blocking HTTP call, so run it in a worker thread to keep the bot responsive.
+    try:
+        answer = await asyncio.to_thread(claude_reply, system_prompt, question)
+    except Exception as exc:
+        answer = f"Claude call failed: {exc}"
+
+    await interaction.followup.send(f"**{name}**: {answer}")
+
+
+# Synchronous Claude call (runs inside asyncio.to_thread). Kept lazy-imported so
+# the bot still starts even if the `anthropic` package isn't installed.
+def claude_reply(system_prompt: str, question: str) -> str:
+    import anthropic
+
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    if not api_key:
+        return "ANTHROPIC_API_KEY is not set. Add it to secrets.env to use /ask."
+
+    client = anthropic.Anthropic(api_key=api_key)
+    message = client.messages.create(
+        model=CLAUDE_MODEL,
+        max_tokens=300,
+        system=system_prompt,
+        messages=[{"role": "user", "content": question}],
+    )
+    return "".join(block.text for block in message.content if block.type == "text")
+
+
 # Global safety net for any slash-command error that isn't handled locally.
 @client.tree.error
 async def on_tree_error(interaction: discord.Interaction, error):
     print(f"ERROR in /{getattr(interaction.command, 'name', 'unknown')}: {error!r}")
+    text = "Something went wrong. Blame the robot, not me."
     try:
-        await interaction.followup.send("Something went wrong. Blame the robot, not me.")
+        # followup only works after an initial response (or defer); otherwise
+        # the interaction must be answered via response.send_message.
+        if interaction.response.is_done():
+            await interaction.followup.send(text)
+        else:
+            await interaction.response.send_message(text)
     except Exception:
-        pass  # followup may already be used; nothing left to do
+        pass  # interaction token may have expired; nothing left to do
+
+
+# Bumped on each release; see CHANGELOG.md for what changed.
+__version__ = "0.3.0"
 
 
 # Only connect to Discord when run directly (not when imported by tests).
 if __name__ == "__main__":
+    print(f"markov_bot_julia v{__version__}")
     client.run(token)

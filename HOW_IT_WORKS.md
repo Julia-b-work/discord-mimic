@@ -9,9 +9,10 @@ document explains *why* each piece behaves the way it does; see
 ## 1. The big picture
 
 The bot has one job: **read what a user writes, learn their style, and write
-new messages in that style.** It does this without any AI model — just a
-statistical trick called a *Markov chain*, plus supporting systems for media
-and persistence.
+new messages in that style.** It does this with a statistical trick called a
+*Markov chain*, plus supporting systems for media and persistence. One optional
+command, /ask, additionally hands a question to Claude and uses the Markov
+output as style examples (§10).
 
 The full lifecycle looks like this:
 
@@ -25,7 +26,8 @@ The full lifecycle looks like this:
 6. It generates a sample sentence and shows it.
 7. Later, /speak, /converse, and spontaneous chat messages generate fresh
    text from the saved chains. The /mode command switches between speaking as
-   the imitated user and speaking as the whole server.
+   the imitated user and speaking as the whole server. /ask answers a real
+   question in the active persona's voice via Claude.
 
 ---
 
@@ -120,21 +122,24 @@ important because a saved chain could theoretically be empty after a bad load.
 
 ---
 
-## 5. Media — images and GIFs (*extract_media*)
+## 5. Media — GIFs (*extract_media*)
 
-The bot mimics not just *words* but *media habits*. Two sources are collected:
-
-1. **Direct uploads** — Discord stores uploaded images as attachment objects
-   with a content type like "image/png". Any attachment whose type starts with
-   "image/" is captured (its URL).
-
-2. **Embedded GIF links** — Tenor/Giphy links often appear as raw URLs in the
-   message text. Any "word" starting with "http" that contains a known GIF host
-   (tenor.com, giphy.com, media.tenor.com) is captured.
+The bot mimics not just *words* but *media habits*. Tenor/Giphy links often
+appear as raw URLs in the message text; any "word" starting with "http" that
+contains a known GIF host (tenor.com, giphy.com, media.tenor.com) is captured.
 
 These URLs are saved with the user and later re-sent by /speak and the
 spontaneous message handler (a 30% chance whenever the bot would otherwise say
 something, falling back to text if the user has no saved media).
+
+### Why direct uploads are *not* collected
+
+Images uploaded straight to Discord get a CDN URL that is **signed and expires
+after roughly 24 hours**. Saving those to *memory.json* would mean the bot
+happily re-posts dead links a day later. Earlier versions did this; it was
+removed on purpose. Only stable public GIF links are kept. (Re-uploading the
+image bytes would work, but means downloading and storing files — out of scope
+for now.)
 
 ---
 
@@ -176,8 +181,19 @@ on disk (list keys):     [[["i", "like"], ["strong", "coffee"]], ...]
 - The loader returns an empty state if the file is missing or corrupt, so a
   fresh install or a truncated file never crashes the bot.
 
+### Atomic writes
+
+Because a corrupt file is treated as "start from scratch", a crash *during* a
+save could silently wipe everything learned. To prevent this the save writes to
+*memory.json.tmp* first and then renames it over *memory.json* with
+`os.replace`, which the operating system performs atomically: the real file is
+always either the complete old version or the complete new one.
+
 The save runs at the end of every /mimic, /servermimic, and /mode, and the load
-runs once at startup, so /speak works immediately after a restart.
+runs once at startup (in the bot's *setup_hook*, which — unlike *on_ready* —
+does not re-fire on reconnects), so /speak works immediately after a restart.
+Slash-command registration (*tree.sync*) lives in the same hook for the same
+reason: Discord rate-limits it, so it should run once, not on every reconnect.
 
 ---
 
@@ -208,11 +224,23 @@ second (rather than every few messages) keeps Discord happy while still looking
 responsive. When the scan finishes, the background task is cancelled and its
 cancellation is awaited so no "task was destroyed" warning is printed.
 
-### Permission resilience
+### Error resilience
 
 If the bot can see a channel but lacks "Read Message History", reading its
-history raises a permission error. Each channel is wrapped in a handler that
-skips it, so one inaccessible channel can't abort the whole scan.
+history raises a permission error; a channel deleted mid-scan raises a
+not-found error. Each channel is wrapped in a handler that catches any Discord
+API error (`HTTPException`, the parent of both), logs which channel was skipped,
+and keeps going, so one bad channel can't abort the whole scan.
+
+### Outliving the interaction token
+
+Discord lets a bot reply to a slash command for only **15 minutes** after it
+was used; after that, followup messages fail. A full-history scan of a busy
+server can take longer than that. So the progress message and the final
+results are sent as *ordinary channel messages* (`channel.send`), which have
+no expiry, rather than as interaction followups. The results message also uses
+`AllowedMentions.none()` so the mentions in it don't ping the people being
+mimicked.
 
 ---
 
@@ -238,6 +266,14 @@ A view with two components:
 A subtle but important detail: the dropdown returns lightweight channel
 objects that **do not** have a history method. Each one must be resolved with
 the guild's channel lookup to get the full text-channel object before scanning.
+That lookup returns nothing for channels the bot doesn't know about (deleted,
+or not cached), so those are filtered out — otherwise a single bad pick would
+crash the whole concurrent scan.
+
+The view also defines its own error hook (*on_error*). Errors raised inside
+component callbacks are **not** delivered to the global slash-command error
+handler (§10), so without it a failure mid-scan would only appear in the
+terminal while the user stared at a "Snooping..." message that never finished.
 
 ### /speak
 
@@ -268,6 +304,24 @@ asterisk. The server (if learned) appears too, labelled "(server)".
 
 Checks that both users have been analyzed, then alternates 5 rounds of
 generated sentences between them.
+
+### /ask
+
+The only command that talks to an AI model. It resolves the active persona
+(same rules as /speak), generates three Markov sentences as *style examples*,
+and sends Claude a system prompt of the form "You are *Name*... here is how
+they write: ...", followed by the user's question. Claude's answer is posted
+as `**Name**: answer`.
+
+Two implementation details:
+
+- The Anthropic call is a blocking HTTP request, so it runs in a worker thread
+  (`asyncio.to_thread`) and the bot stays responsive meanwhile.
+- The `anthropic` package is imported lazily inside the call, so the bot still
+  starts if it isn't installed; only /ask would fail, with a clear message.
+
+Configuration: `ANTHROPIC_API_KEY` (required) and `CLAUDE_MODEL` (optional,
+defaults to `claude-sonnet-4-5`), both read from *secrets.env*.
 
 ---
 
@@ -304,6 +358,13 @@ the user with a friendly message ("Something went wrong. Blame the robot, not me
 Without this, Discord silently shows "application did not respond" and the
 error is invisible.
 
+The reply has to be sent the right way: if the command hasn't answered yet, the
+handler must use the initial response; if it already answered (or deferred), it
+must use a followup. The hook checks `response.is_done()` and picks accordingly,
+so the user actually sees the message in both cases.
+
+View callbacks (the channel picker) have a separate hook of their own — see §8.
+
 ---
 
 ## 11. Tuning parameters
@@ -316,3 +377,5 @@ error is invisible.
 | heat × 0.01, capped at 0.25 | spontaneous-reply odds | 1% per message, max 25% |
 | *MEMORY_FILE* | where learned data is saved | memory.json |
 | channel-picker timeout | how long the picker stays open | 300 s (5 min) |
+| *CLAUDE_MODEL* (env) | which Claude model /ask calls | claude-sonnet-4-5 |
+| *max_tokens* in *claude_reply* | length cap on /ask answers | 300 |
