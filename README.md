@@ -6,7 +6,7 @@ generates brand-new messages in their voice. The core is a plain Markov chain
 with no AI dependencies; an optional `/ask` command layers Claude on top so the
 persona can answer real questions.
 
-**Current version: 0.3.0** — see [CHANGELOG.md](CHANGELOG.md).
+**Current version: 0.4.0** — see [CHANGELOG.md](CHANGELOG.md).
 
 ## What it does
 
@@ -25,11 +25,18 @@ persona can answer real questions.
 | -------------------------------- | -------------------------------------------------------------------- |
 | `/mimic @user [@u2] [@u3] [@u4]` | Pick channels, learn up to **4 users at once**, save their styles. |
 | `/servermimic`                   | Pick channels, learn from **everyone** at once, become the server.   |
-| `/mode user\|server`             | Switch which personality `/speak` and chat replies use.              |
+| `/persona`                       | Dropdown to choose exactly who I talk as (any learned user or the server). |
+| `/mode user\|server`             | Quick toggle between the current user and the server personality.   |
 | `/speak`                         | Generate a new sentence as the active personality.                   |
 | `/users`                         | List everyone learned, marking the active one.                       |
 | `/converse @user1 @user2`        | Simulate a back-and-forth conversation between two learned users.    |
 | `/ask <question>`                | Ask the active persona a question; answered by Claude in their voice (needs an Anthropic API key). |
+| `/what`                          | Explain all commands.                                                |
+
+You can also **@mention the bot** or **reply to one of its messages** to talk to
+the persona directly; it remembers the last few exchanges per channel.
+
+Everything the bot learns is **per server** — personas never leak between guilds.
 
 When `/mimic` or `/servermimic` asks which channels to read, you get a native
 multi-select dropdown — or just hit **"All the channels"** to scan the whole
@@ -123,4 +130,6 @@ style examples and asks Claude to answer your question in that voice.
 - [x] Live progress messages while scanning
 - [x] Persistence to disk (survives restarts)
 - [x] `/ask` — Claude-backed Q&A in the persona's voice
+- [x] `/persona`, `/what`, @mention/reply answers with conversation memory
+- [x] Per-server state
 - [x] Robustness pass: long scans, expiring URLs, error handling, atomic saves

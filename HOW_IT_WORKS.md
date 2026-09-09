@@ -158,6 +158,13 @@ in memory (tuple keys):  {("i", "like"): ["strong", "coffee"], ...}
 on disk (list keys):     [[["i", "like"], ["strong", "coffee"]], ...]
 ```
 
+### Per-server state
+
+Everything below is stored **per guild**: `guilds` maps a guild id to its own
+`{users, current_user_id, mode, server, heat}`. The file is `version: 2`; an
+old flat file is loaded as `legacy` and adopted by the first guild whose name
+matches its server persona. `/persona` picks the active persona within a guild.
+
 ### The file format
 
 ```json
@@ -320,6 +327,11 @@ Two implementation details:
 - The `anthropic` package is imported lazily inside the call, so the bot still
   starts if it isn't installed; only /ask would fail, with a clear message.
 
+Claude is shown up to 40 **real messages** saved at scan time (`samples`, max
+200 per persona), not Markov output, with a strict stay-in-character prompt.
+@mentioning the bot or replying to it goes through the same path, and the last
+8 exchanges per channel are sent as prior turns so follow-ups make sense.
+
 Configuration: `ANTHROPIC_API_KEY` (required) and `CLAUDE_MODEL` (optional,
 defaults to `claude-sonnet-4-5`), both read from *secrets.env*.
 
@@ -332,7 +344,7 @@ counter called *heat*:
 
 ```python
 heat += 1
-chance = min(heat * 0.01, 0.25)   # 1% per message, capped at 25%
+chance = min(heat * 0.02, 0.40)   # 2% per message, capped at 40%
 ```
 
 If a random roll is under the chance, the bot picks a random learned personality
@@ -342,9 +354,9 @@ active mode has nothing to draw from, it stays quiet rather than crashing.
 
 The design intent:
 
-- **Quiet chat stays quiet.** With heat at 1, the chance is only 1%.
-- **Busy chat eventually gets a reply.** After 25 messages the chance is capped
-  at 25%, so the bot reliably interrupts after a burst of activity.
+- **Quiet chat stays quiet.** With heat at 1, the chance is only 2%.
+- **Busy chat eventually gets a reply.** After 20 messages the chance is capped
+  at 40%, so the bot reliably interrupts after a burst of activity.
 - **No self-triggering.** The bot's own messages are ignored (and it never runs
   in DMs or servers where nothing has been learned yet).
 
@@ -374,7 +386,7 @@ View callbacks (the channel picker) have a separate hook of their own — see §
 | sentence word limit (*generate_sentence*) | target sentence length | 30 |
 | *random.random() < 0.4* | entropy jump probability | 0.4 |
 | *random.random() < 0.3* | media re-send probability | 0.3 |
-| heat × 0.01, capped at 0.25 | spontaneous-reply odds | 1% per message, max 25% |
+| heat × 0.02, capped at 0.40 | spontaneous-reply odds | 2% per message, max 40% |
 | *MEMORY_FILE* | where learned data is saved | memory.json |
 | channel-picker timeout | how long the picker stays open | 300 s (5 min) |
 | *CLAUDE_MODEL* (env) | which Claude model /ask calls | claude-sonnet-4-5 |

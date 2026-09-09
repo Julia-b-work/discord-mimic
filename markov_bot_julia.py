@@ -3,6 +3,7 @@ import os  # getenv
 import json  # save/load memory.json
 import asyncio  # concurrent channel scanning + progress ticker
 import random  # all the "personality" randomness
+from collections import deque  # bounded per-channel conversation history
 from typing import Literal  # restricts the /mode argument to fixed choices
 import discord  # the core library
 from discord.ext import commands  # commands.Bot and command decorators
@@ -26,53 +27,113 @@ intents.message_content = True
 # commands; "!" is a harmless placeholder.
 client = commands.Bot(command_prefix="!", intents=intents)
 
-# Learned state, reloaded from disk in setup_hook.
-users = {}
-current_user_id = None
+# Learned state, keyed by guild id (as a string) so each server the bot is in
+# has its own personas, mode and heat. Reloaded from disk in setup_hook.
+# Each value looks like:
+#   {"users": {uid: {...}}, "current_user_id": str|None,
+#    "mode": "user"|"server", "server": dict|None, "heat": int}
+guilds = {}
 
-# "user" -> speak as the current user; "server" -> speak as the whole server.
-mode = "user"
+# Data saved by versions before per-guild state existed. It has no guild id, so
+# it's adopted by the first guild whose name matches its server persona.
+legacy_state = None
 
-# The whole-server chain + media, built by /servermimic. None until learned.
-server = None
 
-# Spontaneous-reply pressure; resets to 0 after the bot speaks.
-heat = 0
+# Return (creating if needed) the state dict for a guild.
+def state(guild):
+    global legacy_state
+    gid = str(guild.id)
+    if gid not in guilds:
+        if legacy_state is not None and (
+            legacy_state["server"] is None
+            or legacy_state["server"]["name"] == guild.name
+        ):
+            guilds[gid] = legacy_state
+            legacy_state = None
+        else:
+            guilds[gid] = {
+                "users": {},
+                "current_user_id": None,
+                "mode": "user",
+                "server": None,
+                "heat": 0,
+            }
+    return guilds[gid]
+
 
 MEMORY_FILE = "memory.json"
+
+# How many raw messages to keep per persona as style examples for /ask.
+MAX_SAMPLES = 200
+
+# Short-term memory for /ask and @mention replies: the last few exchanges per
+# channel, as Claude message dicts. In-memory only; forgotten on restart.
+HISTORY_TURNS = 8
+histories = {}  # channel id -> deque of {"role", "content"}
 
 # Claude integration for /ask: which model to call, overridable via secrets.env.
 CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-5")
 
 
-# Write the whole in-memory state (users, mode, server) to memory.json.
+# Chain keys are (word, word) tuples; JSON only stores lists, so each tuple
+# key is converted to a list here (and back in _chain_from_json).
+def _chain_to_json(chain):
+    return [[list(key), words] for key, words in chain.items()]
+
+
+def _chain_from_json(data):
+    return {tuple(key): words for key, words in data}
+
+
+def _persona_to_json(info):
+    return {
+        "name": info["name"],
+        "chain": _chain_to_json(info["chain"]),
+        "media": info.get("media", []),
+        "samples": info.get("samples", []),
+    }
+
+
+def _persona_from_json(info, default_name="the server"):
+    return {
+        "name": info.get("name", default_name),
+        "chain": _chain_from_json(info.get("chain", [])),
+        "media": info.get("media", []),
+        # Raw example messages for /ask; older saves won't have them.
+        "samples": info.get("samples", []),
+    }
+
+
+def _state_to_json(g):
+    return {
+        "mode": g["mode"],
+        "server": None if g["server"] is None else _persona_to_json(g["server"]),
+        "current_user_id": g["current_user_id"],
+        "users": {uid: _persona_to_json(info) for uid, info in g["users"].items()},
+    }
+
+
+def _state_from_json(data):
+    server_data = data.get("server")
+    return {
+        "users": {
+            uid: _persona_from_json(info) for uid, info in data.get("users", {}).items()
+        },
+        "current_user_id": data.get("current_user_id"),
+        "mode": data.get("mode", "user"),
+        "server": None if server_data is None else _persona_from_json(server_data),
+        "heat": 0,  # never persisted; always starts cold
+    }
+
+
+# Write every guild's state to memory.json.
 def save_users():
     data = {
-        "mode": mode,
-        # Chain keys are (word, word) tuples; JSON only stores lists, so each
-        # tuple key is converted to a list here.
-        "server": (
-            None
-            if server is None
-            else {
-                "name": server["name"],
-                "chain": [
-                    [list(key), words] for key, words in server["chain"].items()
-                ],
-                "media": server.get("media", []),
-            }
-        ),
-        "current_user_id": current_user_id,
-        "users": {
-            uid: {
-                "name": info["name"],
-                # Same tuple -> list conversion, one entry per learned user.
-                "chain": [[list(key), words] for key, words in info["chain"].items()],
-                "media": info.get("media", []),
-            }
-            for uid, info in users.items()
-        },
+        "version": 2,
+        "guilds": {gid: _state_to_json(g) for gid, g in guilds.items()},
     }
+    if legacy_state is not None:
+        data["legacy"] = _state_to_json(legacy_state)
     # Write to a temp file first, then atomically swap it in. A crash mid-write
     # therefore can't leave a truncated memory.json that wipes all learned state.
     tmp_file = MEMORY_FILE + ".tmp"
@@ -81,45 +142,35 @@ def save_users():
     os.replace(tmp_file, MEMORY_FILE)
 
 
-# Read memory.json back. Returns (users, current_user_id, mode, server).
+# Read memory.json back. Returns (guilds, legacy_state).
 # A missing or corrupt file yields an empty default state instead of crashing.
 def load_users():
     try:
         with open(MEMORY_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
-        return {}, None, "user", None
+        return {}, None
 
-    loaded = {}
-    for uid, info in data.get("users", {}).items():
-        loaded[uid] = {
-            "name": info["name"],
-            # Reverse of save_users(): list keys back into tuples.
-            "chain": {tuple(key): words for key, words in info["chain"]},
-            "media": info.get("media", []),
-        }
+    # Version 1 files were a single flat state with no guild id.
+    if "guilds" not in data:
+        return {}, _state_from_json(data)
 
-    server_data = data.get("server")
-    loaded_server = None
-    if server_data is not None:
-        loaded_server = {
-            "name": server_data.get("name", "the server"),
-            "chain": {
-                tuple(key): words for key, words in server_data.get("chain", [])
-            },
-            "media": server_data.get("media", []),
-        }
-
-    return loaded, data.get("current_user_id"), data.get("mode", "user"), loaded_server
+    loaded = {gid: _state_from_json(g) for gid, g in data["guilds"].items()}
+    legacy = _state_from_json(data["legacy"]) if data.get("legacy") else None
+    return loaded, legacy
 
 
 # Runs exactly once, after login but before the gateway connects. Unlike
 # on_ready (which re-fires on every reconnect), this is the right place for
 # one-time work like loading memory and syncing slash commands (rate-limited).
 async def setup_hook():
-    global users, current_user_id, mode, server
+    global guilds, legacy_state
     # Restore everything learned in previous sessions from memory.json.
-    users, current_user_id, mode, server = load_users()
+    guilds, legacy_state = load_users()
+    # All state is per-guild, so none of the commands make sense in DMs.
+    # Discord hides guild-only commands there entirely.
+    for cmd in client.tree.get_commands():
+        cmd.guild_only = True
     # Push the slash-command definitions to Discord so they appear in the UI.
     await client.tree.sync()
 
@@ -135,49 +186,72 @@ async def on_ready():
 
 @client.event
 async def on_message(message):
-    global heat
+    g = state(message.guild)
 
     # Ignore bots (prevents self-echo) and direct messages (no guild).
     if message.author.bot or message.guild is None:
         return
 
     # Nothing learned at all -> nothing to say.
-    if not users and server is None:
+    if not g["users"] and g["server"] is None:
+        return
+
+    # @mentioning the bot, or using Discord's reply feature on one of its
+    # messages, asks the active persona directly (via Claude).
+    ref = message.reference.resolved if message.reference else None
+    replied_to_bot = isinstance(ref, discord.Message) and ref.author == client.user
+    if client.user in message.mentions or replied_to_bot:
+        persona = active_persona(message.guild)
+        if persona is None:
+            return
+        # Strip the mention itself so Claude only sees the actual text.
+        question = message.content.replace(client.user.mention, "").strip()
+        if not question:
+            question = "oi"
+        async with message.channel.typing():
+            answer = await persona_answer(
+                persona, question, message.channel.id, message.author.display_name
+            )
+        reply = f"**{persona['name']}**: {answer}"
+        await message.reply(
+            reply[:2000], allowed_mentions=discord.AllowedMentions.none()
+        )
+        g["heat"] = 0
         return
 
     # Every real message raises the pressure...
-    heat += 1
+    g["heat"] += 1
 
-    # ...turning into a reply chance that caps out at 25%.
-    chance = min(heat * 0.01, 0.25)
+    # ...turning into a reply chance that caps out at 40%.
+    chance = min(g["heat"] * 0.02, 0.40)
 
     if random.random() < chance:
         # We're speaking now, so release the pressure.
-        heat = 0
+        g["heat"] = 0
 
         # In server mode, speak as the combined server personality.
-        if mode == "server" and server is not None:
-            media = server.get("media", [])
+        if g["mode"] == "server" and g["server"] is not None:
+            media = g["server"].get("media", [])
             if media and random.random() < 0.3:
                 await message.channel.send(random.choice(media))
                 return
-            await message.channel.send(generate_sentence(server["chain"]))
+            await message.channel.send(generate_sentence(g["server"]["chain"]))
             return
 
         # Guard: no users learned (e.g. after /servermimic then /mode user).
-        if not users:
+        if not g["users"]:
             return
 
         # Pick a random learned user to impersonate.
-        uid = random.choice(list(users.keys()))
+        uid = random.choice(list(g["users"].keys()))
 
         # 30% chance to re-send one of their saved images/GIFs instead of text.
-        media = users[uid].get("media", [])
+        media = g["users"][uid].get("media", [])
         if media and random.random() < 0.3:
             await message.channel.send(random.choice(media))
             return
 
-        sentence = generate_sentence(users[uid]["chain"])
+        sentence = generate_sentence(g["users"][uid]["chain"])
         await message.channel.send(sentence)
 
 
@@ -251,12 +325,23 @@ def extract_media(message):
     return urls
 
 
+# Keep a random subset of real messages (skipping one-word replies and bare
+# links) to show Claude how this persona actually writes.
+def pick_samples(messages, limit=MAX_SAMPLES):
+    good = [
+        m for m in messages
+        if len(m.split()) >= 3 and not m.startswith("http")
+    ]
+    return random.sample(good, min(limit, len(good)))
+
+
 # Scan channels, build one chain per target user, store + save, then reply.
 async def run_mimic(interaction, targets, channels):
     # Post an editable "working..." message; updated live during the scan.
     # Sent as a normal channel message (not an interaction followup) because
     # interaction tokens expire after 15 minutes and a full history scan of a
     # big server can easily take longer than that.
+    g = state(interaction.guild)
     progress = await interaction.channel.send("Snooping through messages...")
 
     target_ids = {user.id for user in targets}
@@ -319,8 +404,6 @@ async def run_mimic(interaction, targets, channels):
             f"Messages read: {read_count}"
         )
     )
-
-    global users, current_user_id
     results = []
 
     # Learn + store each target, and collect a sample line for the reply.
@@ -345,12 +428,15 @@ async def run_mimic(interaction, targets, channels):
             continue
 
         # Store under the user's id (as a string, since JSON keys must be strings).
-        users[str(user.id)] = {
+        g["users"][str(user.id)] = {
             "name": user.display_name,
             "chain": chain,
             "media": media_by_user[user.id],
+            # A random subset of their real messages, so /ask can show Claude
+            # genuine writing rather than Markov output.
+            "samples": pick_samples(messages),
         }
-        current_user_id = str(user.id)
+        g["current_user_id"] = str(user.id)
 
         # Generate a sample sentence as proof of learning.
         sentence = generate_sentence(chain)
@@ -369,6 +455,7 @@ async def run_mimic(interaction, targets, channels):
 # Same overall shape as run_mimic, but there's a single combined personality.
 async def run_server_mimic(interaction, channels):
     # channel.send rather than followup: see run_mimic for why (15-minute tokens).
+    g = state(interaction.guild)
     progress = await interaction.channel.send("Snooping through messages...")
 
     all_messages = []
@@ -423,8 +510,6 @@ async def run_server_mimic(interaction, channels):
         )
     )
 
-    global mode, server
-
     # Nothing but bots (or nothing at all) -> can't learn the server.
     if not all_messages:
         await interaction.channel.send(
@@ -442,12 +527,13 @@ async def run_server_mimic(interaction, channels):
         return
 
     # Store the combined personality and switch into server mode.
-    server = {
+    g["server"] = {
         "name": interaction.guild.name,
         "chain": chain,
         "media": all_media,
+        "samples": pick_samples(all_messages),
     }
-    mode = "server"
+    g["mode"] = "server"
     save_users()
 
     sentence = generate_sentence(chain)
@@ -558,53 +644,109 @@ async def set_mode(
     interaction: discord.Interaction,
     new_mode: Literal["user", "server"],
 ):
-    global mode
+    g = state(interaction.guild)
 
     # Can't switch to server mode if /servermimic has never been run.
-    if new_mode == "server" and server is None:
+    if new_mode == "server" and g["server"] is None:
         await interaction.response.send_message(
             "I haven't learned this server yet. Use /servermimic first!"
         )
         return
 
-    mode = new_mode
+    g["mode"] = new_mode
     save_users()  # persist the choice so it survives a restart
 
-    label = "the whole server" if mode == "server" else "the imitated user"
+    label = "the whole server" if g["mode"] == "server" else "the imitated user"
     await interaction.response.send_message(f"Switched! Now I talk as {label}.")
+
+
+# /persona — pick exactly who to talk as (any learned user, or the server).
+# Uses a dropdown, so it also fixes the gap that /mode only toggles user/server
+# and can't choose *which* user.
+@client.tree.command(name="persona", description="Choose who I talk as")
+async def persona_cmd(interaction: discord.Interaction):
+    g = state(interaction.guild)
+    if not g["users"] and g["server"] is None:
+        await interaction.response.send_message(
+            "I don't know anyone yet. Go run /mimic on somebody!"
+        )
+        return
+
+    options = []
+    for uid, info in g["users"].items():
+        options.append(
+            discord.SelectOption(
+                label=info["name"][:100],
+                value=uid,
+                default=(g["mode"] == "user" and uid == g["current_user_id"]),
+            )
+        )
+    if g["server"] is not None:
+        options.append(
+            discord.SelectOption(
+                label=f"{g["server"]['name'][:90]} (server)",
+                value="__server__",
+                default=(g["mode"] == "server"),
+            )
+        )
+
+    # Discord caps a dropdown at 25 options.
+    options = options[:25]
+
+    view = discord.ui.View(timeout=120)
+    select = discord.ui.Select(placeholder="Pick a persona", options=options)
+
+    async def on_pick(pick_interaction):
+        choice = select.values[0]
+        if choice == "__server__":
+            g["mode"] = "server"
+            label = f"**{g["server"]['name']}** (the whole server)"
+        else:
+            g["mode"] = "user"
+            g["current_user_id"] = choice
+            label = f"**{g["users"][choice]['name']}**"
+        save_users()
+        await pick_interaction.response.edit_message(
+            content=f"Switched! Now I talk as {label}.", view=None
+        )
+
+    select.callback = on_pick
+    view.add_item(select)
+    await interaction.response.send_message("Who should I be?", view=view)
 
 
 # /speak — produce one sentence on demand, obeying the current mode.
 @client.tree.command(name="speak", description="Speak as the imitated user")
 async def speak(interaction: discord.Interaction):
     # Server mode: talk as the combined server personality.
-    if mode == "server":
-        if server is None:
+    g = state(interaction.guild)
+    if g["mode"] == "server":
+        if g["server"] is None:
             await interaction.response.send_message(
                 "I haven't learned this server yet. Use /servermimic first!"
             )
             return
 
         # 30% chance to reply with a saved image/GIF instead of text.
-        media = server.get("media", [])
+        media = g["server"].get("media", [])
         if media and random.random() < 0.3:
             await interaction.response.send_message(random.choice(media))
             return
 
-        await interaction.response.send_message(generate_sentence(server["chain"]))
+        await interaction.response.send_message(generate_sentence(g["server"]["chain"]))
         return
 
     # User mode: talk as the most recently /mimic'd user.
-    if current_user_id is None or current_user_id not in users:
+    if g["current_user_id"] is None or g["current_user_id"] not in g["users"]:
         await interaction.response.send_message(
             "I'm not pretending to be anyone yet. Use /mimic first!"
         )
         return
 
-    sentence = generate_sentence(users[current_user_id]["chain"])
+    sentence = generate_sentence(g["users"][g["current_user_id"]]["chain"])
 
     # Same 30% media chance as above, drawn from the user's own posts.
-    media = users[current_user_id].get("media", [])
+    media = g["users"][g["current_user_id"]].get("media", [])
     if media and random.random() < 0.3:
         await interaction.response.send_message(random.choice(media))
         return
@@ -616,22 +758,23 @@ async def speak(interaction: discord.Interaction):
 # on whoever is currently active.
 @client.tree.command(name="users", description="Who have I been spying on?")
 async def list_users(interaction: discord.Interaction):
-    if not users and server is None:
+    g = state(interaction.guild)
+    if not g["users"] and g["server"] is None:
         await interaction.response.send_message(
             "I don't know anyone yet. Go run /mimic on somebody!"
         )
         return
 
     lines = []
-    for uid, info in users.items():
+    for uid, info in g["users"].items():
         # The " *" suffix marks the user who is active in "user" mode.
-        marker = " *" if (uid == current_user_id and mode == "user") else ""
+        marker = " *" if (uid == g["current_user_id"] and g["mode"] == "user") else ""
         lines.append(f"**{info['name']}**{marker}")
 
     # The server personality is listed separately, marked when in server mode.
-    if server is not None:
-        server_marker = " *" if mode == "server" else ""
-        lines.append(f"**{server['name']}** (server){server_marker}")
+    if g["server"] is not None:
+        server_marker = " *" if g["mode"] == "server" else ""
+        lines.append(f"**{g["server"]['name']}** (server){server_marker}")
 
     await interaction.response.send_message("\n".join(lines))
 
@@ -646,10 +789,11 @@ async def converse(
     user2: discord.Member,
 ):
     # Collect whichever participants haven't been /mimic'd yet.
+    g = state(interaction.guild)
     missing = []
-    if str(user1.id) not in users:
+    if str(user1.id) not in g["users"]:
         missing.append(user1.mention)
-    if str(user2.id) not in users:
+    if str(user2.id) not in g["users"]:
         missing.append(user2.mention)
 
     if missing:
@@ -658,10 +802,10 @@ async def converse(
         )
         return
 
-    chain1 = users[str(user1.id)]["chain"]
-    chain2 = users[str(user2.id)]["chain"]
-    name1 = users[str(user1.id)]["name"]
-    name2 = users[str(user2.id)]["name"]
+    chain1 = g["users"][str(user1.id)]["chain"]
+    chain2 = g["users"][str(user2.id)]["chain"]
+    name1 = g["users"][str(user1.id)]["name"]
+    name2 = g["users"][str(user2.id)]["name"]
 
     # Five back-and-forth rounds, each line freshly generated.
     lines = []
@@ -672,16 +816,121 @@ async def converse(
     await interaction.response.send_message("\n".join(lines))
 
 
+# /what — explain every command. Uses an embed so it reads cleanly in Discord.
+@client.tree.command(name="what", description="What can this bot do?")
+async def what(interaction: discord.Interaction):
+    embed = discord.Embed(
+        title="o_mimico — what I do",
+        description=(
+            "I read people's messages, learn how they write, and then talk like "
+            "them. Learning is per server: what I learn here stays here."
+        ),
+        color=discord.Color.blurple(),
+    )
+    embed.add_field(
+        name="Learning",
+        value=(
+            "`/mimic @user [@u2 @u3 @u4]` — pick channels, learn up to 4 people.\n"
+            "`/servermimic` — learn from everyone at once and become the server."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="Choosing who I am",
+        value=(
+            "`/persona` — dropdown of everyone I've learned (and the server).\n"
+            "`/mode user|server` — quick toggle between a person and the server.\n"
+            "`/users` — list everyone I've learned; `*` marks who I am right now."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="Talking",
+        value=(
+            "`/speak` — one sentence in the current persona's style.\n"
+            "`/converse @a @b` — a fake 5-round conversation between two people.\n"
+            "`/ask <question>` — ask the persona anything; answered by Claude in "
+            "their voice.\n"
+            "**@mention me** or **reply to my messages** — same as `/ask`, and I "
+            "remember the last few exchanges in the channel."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="On my own",
+        value=(
+            "The busier the chat, the more likely I butt in with a sentence or a "
+            "GIF as the current persona (up to a 40% chance per message)."
+        ),
+        inline=False,
+    )
+    embed.set_footer(text=f"v{__version__} · /what shows this again")
+    await interaction.response.send_message(embed=embed)
+
+
+# Return the active persona dict (server or current user), or None.
+def active_persona(guild):
+    g = state(guild)
+    if g["mode"] == "server" and g["server"] is not None:
+        return g["server"]
+    if g["mode"] == "user" and g["current_user_id"] in g["users"]:
+        return g["users"][g["current_user_id"]]
+    return None
+
+
+# Ask Claude to answer `question` as `persona`. Returns the answer text.
+# Shared by /ask and by @mention replies in on_message.
+async def persona_answer(persona, question, channel_id, asker=None):
+    name = persona["name"]
+
+    # Prefer real messages saved at scan time; fall back to Markov output for
+    # personas learned before samples were stored.
+    raw = persona.get("samples") or []
+    if raw:
+        examples = random.sample(raw, min(40, len(raw)))
+    else:
+        examples = [generate_sentence(persona["chain"]) for _ in range(8)]
+    samples = "\n".join(f"- {line}" for line in examples)
+
+    system_prompt = (
+        f"You are roleplaying as {name}, a regular member of a Discord server. "
+        "You are NOT an assistant. Never offer help, never explain yourself, "
+        "never mention being an AI. Reply with ONE short Discord message, the "
+        "way this person would type it in chat.\n\n"
+        "Copy their style exactly from the examples below: same language, "
+        "same slang, same casing and punctuation habits, similar message "
+        "length, same use (or absence) of emoji. If the examples are in "
+        "Portuguese, answer in Portuguese. Stay in character even if the "
+        "question is odd.\n\n"
+        f"Real messages {name} has written:\n{samples}"
+    )
+
+    # Prior turns in this channel, so follow-up questions make sense. Each
+    # user turn is prefixed with who said it, since several people may chat.
+    history = histories.setdefault(channel_id, deque(maxlen=2 * HISTORY_TURNS))
+    user_turn = f"{asker}: {question}" if asker else question
+    messages = list(history) + [{"role": "user", "content": user_turn}]
+
+    # Blocking HTTP call, so run it in a worker thread to keep the bot responsive.
+    try:
+        answer = await asyncio.to_thread(claude_reply, system_prompt, messages)
+    except Exception as exc:
+        # Log the real error; don't leak API/auth details into chat.
+        print(f"ERROR calling Claude: {exc!r}")
+        return "..."
+
+    # Remember this exchange (the deque drops the oldest turns automatically).
+    history.append({"role": "user", "content": user_turn})
+    history.append({"role": "assistant", "content": answer})
+    return answer
+
+
 # /ask <question> — have Claude answer in the active persona's voice.
-# Persona style comes from a few Markov samples, so Claude imitates the vibe.
 @client.tree.command(name="ask", description="Ask the active persona anything (Claude)")
 async def ask(interaction: discord.Interaction, question: str):
-    # Resolve the active persona (same logic as /speak).
-    if mode == "server" and server is not None:
-        name, chain = server["name"], server["chain"]
-    elif mode == "user" and current_user_id in users:
-        name, chain = users[current_user_id]["name"], users[current_user_id]["chain"]
-    else:
+    g = state(interaction.guild)
+    persona = active_persona(interaction.guild)
+    if persona is None:
         await interaction.response.send_message(
             "I'm not pretending to be anyone yet. Use /mimic or /servermimic first!"
         )
@@ -690,28 +939,21 @@ async def ask(interaction: discord.Interaction, question: str):
     # The Claude call takes a few seconds; defer so Discord doesn't time out.
     await interaction.response.defer()
 
-    # Sample the Markov chain a few times to show Claude how this person writes.
-    samples = "\n".join(
-        f"- {generate_sentence(chain)}" for _ in range(3)
-    )
-    system_prompt = (
-        f"You are {name}, a member of this Discord server. "
-        f"Answer in first person, briefly, matching {name}'s tone and vocabulary. "
-        f"Sample messages {name} has written, to copy the style:\n{samples}"
+    answer = await persona_answer(
+        persona, question, interaction.channel_id, interaction.user.display_name
     )
 
-    # Blocking HTTP call, so run it in a worker thread to keep the bot responsive.
-    try:
-        answer = await asyncio.to_thread(claude_reply, system_prompt, question)
-    except Exception as exc:
-        answer = f"Claude call failed: {exc}"
-
-    await interaction.followup.send(f"**{name}**: {answer}")
+    # Echo the question (slash-command input is otherwise invisible to others),
+    # then the answer. Trimmed to stay under Discord's 2000-character limit.
+    reply = f"> {interaction.user.display_name}: {question}\n**{persona['name']}**: {answer}"
+    await interaction.followup.send(
+        reply[:2000], allowed_mentions=discord.AllowedMentions.none()
+    )
 
 
 # Synchronous Claude call (runs inside asyncio.to_thread). Kept lazy-imported so
 # the bot still starts even if the `anthropic` package isn't installed.
-def claude_reply(system_prompt: str, question: str) -> str:
+def claude_reply(system_prompt: str, messages: list) -> str:
     import anthropic
 
     api_key = os.getenv("ANTHROPIC_API_KEY")
@@ -721,9 +963,9 @@ def claude_reply(system_prompt: str, question: str) -> str:
     client = anthropic.Anthropic(api_key=api_key)
     message = client.messages.create(
         model=CLAUDE_MODEL,
-        max_tokens=300,
+        max_tokens=200,
         system=system_prompt,
-        messages=[{"role": "user", "content": question}],
+        messages=messages,
     )
     return "".join(block.text for block in message.content if block.type == "text")
 
@@ -745,7 +987,7 @@ async def on_tree_error(interaction: discord.Interaction, error):
 
 
 # Bumped on each release; see CHANGELOG.md for what changed.
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 
 # Only connect to Discord when run directly (not when imported by tests).

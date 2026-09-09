@@ -7,7 +7,12 @@ It is written for someone who has never written a Discord bot — or any Python 
 before. If a term like "decorator" or "intent" means nothing to you yet, don't
 worry: each one is explained the first time it appears.
 
-Line numbers refer to the current version of the file (754 lines). To follow
+> **Note:** this walkthrough was written for **v0.3.0** (754 lines). Version
+> 0.4.0 added per-server state, `/persona`, `/what`, @mention replies and
+> conversation memory, so line numbers and the storage sections (4–7) are out
+> of date. See *CHANGELOG.md* and *HOW_IT_WORKS.md* for what changed.
+
+Line numbers refer to v0.3.0 of the file (754 lines). To follow
 along, open *markov_bot_julia.py* next to this document and read them together.
 
 ---

@@ -3,6 +3,33 @@
 All notable changes to this project are recorded here. Versions follow
 [Semantic Versioning](https://semver.org/): MAJOR.MINOR.PATCH.
 
+## [0.4.0] - 2026-09-09
+
+### Added
+- **Per-server state.** Every guild now has its own learned users, active
+  persona, mode, server chain and heat. `memory.json` moved to a `version: 2`
+  format keyed by guild id; old files are migrated automatically (kept as
+  `legacy` and adopted by the guild whose name matches). All commands are
+  guild-only.
+- `/persona` — dropdown to pick exactly who to talk as (any learned user or the
+  server). `/mode` remains as a quick toggle.
+- `/what` — embed explaining every command.
+- **@mention and reply triggers.** Mentioning the bot, or replying to one of
+  its messages, gets a Claude answer in persona (same path as `/ask`).
+- **Conversation memory.** The last 8 exchanges per channel are sent to Claude
+  as prior turns, so follow-up questions work. In-memory only.
+
+### Changed
+- `/ask` replies were generic: Claude was only shown 3 Markov sentences. Scans
+  now keep up to 200 real messages per persona (`samples`), and `/ask` sends 40
+  of them with a strict stay-in-character prompt (match language, slang,
+  casing, length; no assistant tone). Re-run `/mimic` or `/servermimic` to
+  populate samples for existing personas.
+- `/ask` and mention replies show `**Name**:` and echo the question.
+- Spontaneous replies: 2% per message, capped at 40% (was 1% / 25%).
+- Claude errors are logged to the terminal; chat just gets "...".
+- `max_tokens` for `/ask` lowered to 200.
+
 ## [0.3.0] - 2026-09-09
 
 ### Added
