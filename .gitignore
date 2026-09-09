@@ -4,3 +4,5 @@ secrets.env
 __pycache__/
 *.pyc
 memory.json
+bot.log
+bot.pid
