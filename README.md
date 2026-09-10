@@ -133,3 +133,14 @@ style examples and asks Claude to answer your question in that voice.
 - [x] `/persona`, `/what`, @mention/reply answers with conversation memory
 - [x] Per-server state
 - [x] Robustness pass: long scans, expiring URLs, error handling, atomic saves
+
+## Author
+
+Built by **Julia Barrios** — a developer working primarily in C, C++, and Python.
+
+- GitHub: [@Julia-b-work](https://github.com/Julia-b-work)
+- Portfolio: [portfolio-6rx8.onrender.com](https://portfolio-6rx8.onrender.com)
+
+## License
+
+Distributed under the [MIT License](LICENSE).
