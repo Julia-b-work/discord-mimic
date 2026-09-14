@@ -64,12 +64,15 @@ def state(guild):
 MEMORY_FILE = "memory.json"
 
 # How many raw messages to keep per persona as style examples for /ask.
-MAX_SAMPLES = 200
+MAX_SAMPLES = 500
+
+# Messages read per channel during a scan. None = the entire history.
+HISTORY_LIMIT = None
 
 # Short-term memory for /ask and @mention replies: the last few exchanges per
 # channel, as Claude message dicts. In-memory only; forgotten on restart.
 HISTORY_TURNS = 8
-histories = {}  # channel id -> deque of {"role", "content"}
+histories = {}  # (channel id, persona name) -> deque of {"role", "content"}
 
 # Claude integration for /ask: which model to call, overridable via secrets.env.
 CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-5")
@@ -222,37 +225,26 @@ async def on_message(message):
     # Every real message raises the pressure...
     g["heat"] += 1
 
-    # ...turning into a reply chance that caps out at 40%.
-    chance = min(g["heat"] * 0.02, 0.40)
+    # ...turning into a reply chance that caps out at 80%.
+    chance = min(g["heat"] * 0.06, 0.80)
 
     if random.random() < chance:
         # We're speaking now, so release the pressure.
         g["heat"] = 0
 
-        # In server mode, speak as the combined server personality.
-        if g["mode"] == "server" and g["server"] is not None:
-            media = g["server"].get("media", [])
-            if media and random.random() < 0.3:
-                await message.channel.send(random.choice(media))
-                return
-            await message.channel.send(generate_sentence(g["server"]["chain"]))
+        # Speak as the currently selected persona (the same one /speak uses).
+        persona = active_persona(message.guild)
+        if persona is None:
             return
-
-        # Guard: no users learned (e.g. after /servermimic then /mode user).
-        if not g["users"]:
-            return
-
-        # Pick a random learned user to impersonate.
-        uid = random.choice(list(g["users"].keys()))
 
         # 30% chance to re-send one of their saved images/GIFs instead of text.
-        media = g["users"][uid].get("media", [])
+        media = persona.get("media", [])
         if media and random.random() < 0.3:
             await message.channel.send(random.choice(media))
             return
 
-        sentence = generate_sentence(g["users"][uid]["chain"])
-        await message.channel.send(sentence)
+        sentence = await spontaneous_reply(persona, message)
+        await message.channel.send(f"**{persona['name']}**: {sentence}")
 
 
 # Map each (word, word) pair to a list of words that follow it.
@@ -342,6 +334,7 @@ async def run_mimic(interaction, targets, channels):
     # interaction tokens expire after 15 minutes and a full history scan of a
     # big server can easily take longer than that.
     g = state(interaction.guild)
+    print(f"scan start (mimic) in {interaction.guild.name}: {len(channels)} channels")
     progress = await interaction.channel.send("Snooping through messages...")
 
     target_ids = {user.id for user in targets}
@@ -354,8 +347,8 @@ async def run_mimic(interaction, targets, channels):
         channel_messages = {uid: [] for uid in target_ids}
         channel_media = {uid: [] for uid in target_ids}
         try:
-            # limit=None reads the channel's entire history, oldest to newest.
-            async for message in channel.history(limit=None):
+            # HISTORY_LIMIT=None reads the channel's entire history.
+            async for message in channel.history(limit=HISTORY_LIMIT):
                 read_count += 1
                 # Only collect messages from the target users.
                 if message.author.id in target_ids:
@@ -398,6 +391,7 @@ async def run_mimic(interaction, targets, channels):
             media_by_user[uid].extend(channel_media[uid])
 
     total_messages = sum(len(m) for m in messages_by_user.values())
+    print(f"scan done (mimic) in {interaction.guild.name}: {read_count} read, {total_messages} kept")
     await progress.edit(
         content=(
             f"Snooping complete! {total_messages} messages.\n"
@@ -456,6 +450,7 @@ async def run_mimic(interaction, targets, channels):
 async def run_server_mimic(interaction, channels):
     # channel.send rather than followup: see run_mimic for why (15-minute tokens).
     g = state(interaction.guild)
+    print(f"scan start (server) in {interaction.guild.name}: {len(channels)} channels")
     progress = await interaction.channel.send("Snooping through messages...")
 
     all_messages = []
@@ -467,7 +462,7 @@ async def run_server_mimic(interaction, channels):
         channel_messages = []
         channel_media = []
         try:
-            async for message in channel.history(limit=None):
+            async for message in channel.history(limit=HISTORY_LIMIT):
                 read_count += 1
                 # Skip bot messages so the mimicry doesn't learn from other bots.
                 if message.author.bot:
@@ -503,6 +498,7 @@ async def run_server_mimic(interaction, channels):
         all_media.extend(channel_media)
 
     total_messages = len(all_messages)
+    print(f"scan done (server) in {interaction.guild.name}: {read_count} read, {total_messages} kept")
     await progress.edit(
         content=(
             f"Snooping complete! {total_messages} messages.\n"
@@ -860,7 +856,7 @@ async def what(interaction: discord.Interaction):
         name="On my own",
         value=(
             "The busier the chat, the more likely I butt in with a sentence or a "
-            "GIF as the current persona (up to a 40% chance per message)."
+            "GIF as the current persona (up to an 80% chance per message)."
         ),
         inline=False,
     )
@@ -880,7 +876,9 @@ def active_persona(guild):
 
 # Ask Claude to answer `question` as `persona`. Returns the answer text.
 # Shared by /ask and by @mention replies in on_message.
-async def persona_answer(persona, question, channel_id, asker=None):
+# Build the "stay in character" system prompt for a persona. Shared by /ask,
+# mention replies and spontaneous context-aware messages.
+def persona_system_prompt(persona):
     name = persona["name"]
 
     # Prefer real messages saved at scan time; fall back to Markov output for
@@ -892,7 +890,7 @@ async def persona_answer(persona, question, channel_id, asker=None):
         examples = [generate_sentence(persona["chain"]) for _ in range(8)]
     samples = "\n".join(f"- {line}" for line in examples)
 
-    system_prompt = (
+    return (
         f"You are roleplaying as {name}, a regular member of a Discord server. "
         "You are NOT an assistant. Never offer help, never explain yourself, "
         "never mention being an AI. Reply with ONE short Discord message, the "
@@ -905,9 +903,14 @@ async def persona_answer(persona, question, channel_id, asker=None):
         f"Real messages {name} has written:\n{samples}"
     )
 
+
+async def persona_answer(persona, question, channel_id, asker=None):
+    name = persona["name"]
+    system_prompt = persona_system_prompt(persona)
+
     # Prior turns in this channel, so follow-up questions make sense. Each
     # user turn is prefixed with who said it, since several people may chat.
-    history = histories.setdefault(channel_id, deque(maxlen=2 * HISTORY_TURNS))
+    history = histories.setdefault((channel_id, name), deque(maxlen=2 * HISTORY_TURNS))
     user_turn = f"{asker}: {question}" if asker else question
     messages = list(history) + [{"role": "user", "content": user_turn}]
 
@@ -922,6 +925,44 @@ async def persona_answer(persona, question, channel_id, asker=None):
     # Remember this exchange (the deque drops the oldest turns automatically).
     history.append({"role": "user", "content": user_turn})
     history.append({"role": "assistant", "content": answer})
+    return answer
+
+
+# Generate a spontaneous in-character reply based on the last few messages in
+# the channel. Falls back to a plain Markov sentence if there's no context.
+async def spontaneous_reply(persona, message):
+    # Read the 4 messages just before this one as conversational context.
+    context = []
+    try:
+        async for m in message.channel.history(limit=4, before=message):
+            if m.content.strip():
+                context.append(f"{m.author.display_name}: {m.content}")
+    except discord.HTTPException:
+        context = []
+
+    # Nothing readable before this message -> fall back to Markov output.
+    if not context:
+        return generate_sentence(persona["chain"])
+
+    # Oldest first, so Claude reads the conversation in order.
+    transcript = "\n".join(reversed(context))
+
+    turn = (
+        "Here are the last few messages in the chat:\n"
+        f"{transcript}\n\n"
+        "Reply as this person, naturally continuing the conversation. "
+        "ONE short message, no narration, no quoting."
+    )
+
+    try:
+        answer = await asyncio.to_thread(
+            claude_reply,
+            persona_system_prompt(persona),
+            [{"role": "user", "content": turn}],
+        )
+    except Exception as exc:
+        print(f"ERROR calling Claude: {exc!r}")
+        return "..."
     return answer
 
 
@@ -987,7 +1028,7 @@ async def on_tree_error(interaction: discord.Interaction, error):
 
 
 # Bumped on each release; see CHANGELOG.md for what changed.
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 
 # Only connect to Discord when run directly (not when imported by tests).

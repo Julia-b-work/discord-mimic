@@ -344,19 +344,22 @@ counter called *heat*:
 
 ```python
 heat += 1
-chance = min(heat * 0.02, 0.40)   # 2% per message, capped at 40%
+chance = min(heat * 0.06, 0.80)   # 6% per message, capped at 80%
 ```
 
-If a random roll is under the chance, the bot picks a random learned personality
-and says something (30% media, else text), then resets *heat* to 0. In "server"
-mode it draws from the whole-server chain instead of a single user; if the
-active mode has nothing to draw from, it stays quiet rather than crashing.
+If a random roll is under the chance, the bot speaks as the **currently selected
+persona** (the same one `/persona` and `/speak` use), then resets *heat* to 0.
+Before speaking it reads the last four messages in the channel and asks Claude
+to continue the conversation in that persona's voice; if there's no readable
+context (or Claude is unavailable) it falls back to a plain Markov sentence.
+Either way the reply is prefixed with the persona's name. There's still a 30%
+chance it re-sends one of the persona's saved GIFs instead of text.
 
 The design intent:
 
-- **Quiet chat stays quiet.** With heat at 1, the chance is only 2%.
-- **Busy chat eventually gets a reply.** After 20 messages the chance is capped
-  at 40%, so the bot reliably interrupts after a burst of activity.
+- **Quiet chat stays quiet.** With heat at 1, the chance is only 6%.
+- **Busy chat gets frequent replies.** The chance grows quickly and is capped at
+  80%, so the bot reliably jumps in during bursts of activity.
 - **No self-triggering.** The bot's own messages are ignored (and it never runs
   in DMs or servers where nothing has been learned yet).
 
@@ -386,8 +389,8 @@ View callbacks (the channel picker) have a separate hook of their own — see §
 | sentence word limit (*generate_sentence*) | target sentence length | 30 |
 | *random.random() < 0.4* | entropy jump probability | 0.4 |
 | *random.random() < 0.3* | media re-send probability | 0.3 |
-| heat × 0.02, capped at 0.40 | spontaneous-reply odds | 2% per message, max 40% |
+| heat × 0.06, capped at 0.80 | spontaneous-reply odds | 6% per message, max 80% |
 | *MEMORY_FILE* | where learned data is saved | memory.json |
 | channel-picker timeout | how long the picker stays open | 300 s (5 min) |
 | *CLAUDE_MODEL* (env) | which Claude model /ask calls | claude-sonnet-4-5 |
-| *max_tokens* in *claude_reply* | length cap on /ask answers | 300 |
+| *max_tokens* in *claude_reply* | length cap on /ask answers | 200 |

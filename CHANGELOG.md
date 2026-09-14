@@ -3,6 +3,25 @@
 All notable changes to this project are recorded here. Versions follow
 [Semantic Versioning](https://semver.org/): MAJOR.MINOR.PATCH.
 
+## [0.5.0] - 2026-09-14
+
+### Added
+- **Context-aware spontaneous replies.** When the bot chimes in on its own, it
+  now reads the last 4 messages in the channel and asks Claude to continue the
+  conversation in the active persona's voice (falls back to a plain Markov
+  sentence when there's no readable context or Claude is unavailable).
+- Spontaneous replies now speak as the **selected persona** (the one `/persona`
+  and `/speak` use), not a random learned user, and are prefixed with the
+  persona's name.
+
+### Changed
+- Spontaneous-reply odds raised to **6% per message, capped at 80%** (was
+  2% / 40%).
+- `MAX_SAMPLES` raised to 500 (was 200); scans now read the full history via a
+  `HISTORY_LIMIT` constant.
+- Conversation memory is keyed per `(channel, persona)` instead of per channel,
+  so switching personas starts fresh short-term context.
+
 ## [0.4.0] - 2026-09-09
 
 ### Added

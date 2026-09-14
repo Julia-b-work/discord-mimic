@@ -3,10 +3,11 @@
 A Discord bot that learns to talk *like you* — or like your friends. Feed it a
 user's chat history and it builds a statistical model of how they write, then
 generates brand-new messages in their voice. The core is a plain Markov chain
-with no AI dependencies; an optional `/ask` command layers Claude on top so the
-persona can answer real questions.
+with no AI dependencies; Claude layers on top so the persona can answer real
+questions (`/ask`), respond to mentions/replies, and even chime in on its own
+with context from recent messages.
 
-**Current version: 0.4.0** — see [CHANGELOG.md](CHANGELOG.md).
+**Current version: 0.5.0** — see [CHANGELOG.md](CHANGELOG.md).
 
 ## What it does
 
@@ -16,8 +17,8 @@ persona can answer real questions.
   persona built from the whole server's chatter.
 - Speaks back in the learned style — including re-sending the GIFs they post.
 - Optionally answers questions *as* the learned persona using Claude (`/ask`).
-- Can even lurk in the chat and chime in spontaneously as one of its learned
-  personalities.
+- Can even lurk in the chat and chime in spontaneously as the selected persona,
+  reading recent messages for context.
 
 ## Commands
 
@@ -56,8 +57,9 @@ a user posts and occasionally re-sends them, so the persona feels more complete.
 (Direct image uploads are skipped on purpose — Discord's attachment URLs expire
 after about a day.)
 
-`/ask` is the one exception to "no AI": it samples a few Markov sentences as
-style examples and asks Claude to answer your question in that voice.
+The Claude layer (used by `/ask`, mention/reply answers, and context-aware
+spontaneous replies) is the one exception to "no AI": it samples real messages
+as style examples and asks Claude to write in that voice.
 
 ## Tech stack
 
@@ -74,7 +76,7 @@ style examples and asks Claude to answer your question in that voice.
 - `requirements.txt` — pinned Python dependencies.
 - `memory.json` — the learned styles, written automatically after each `/mimic`.
 - `HOW_IT_WORKS.md` — conceptual explanation of every mechanism.
-- `LINE_BY_LINE.md` — every line of the code explained.
+- `LINE_BY_LINE.md` — a function-by-function tour of the code.
 - `CHANGELOG.md` — what changed in each version.
 - `secrets.env` — your bot token and API key (never committed).
 - `.env.example` — template for `secrets.env`.
@@ -131,6 +133,7 @@ style examples and asks Claude to answer your question in that voice.
 - [x] Persistence to disk (survives restarts)
 - [x] `/ask` — Claude-backed Q&A in the persona's voice
 - [x] `/persona`, `/what`, @mention/reply answers with conversation memory
+- [x] Context-aware spontaneous replies (reads recent messages, Claude in-character)
 - [x] Per-server state
 - [x] Robustness pass: long scans, expiring URLs, error handling, atomic saves
 
