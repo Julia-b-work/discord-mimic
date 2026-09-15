@@ -3,6 +3,21 @@
 All notable changes to this project are recorded here. Versions follow
 [Semantic Versioning](https://semver.org/): MAJOR.MINOR.PATCH.
 
+## [0.5.1] - 2026-09-15
+
+### Fixed
+- **DM messages crashed the handler.** `on_message` called `state(message.guild)`
+  before checking for a missing guild, so a direct message raised
+  `AttributeError` on a `None` guild. The bot/DM guard now runs first.
+- **403 "Missing Permissions" spam.** Spontaneous replies and mention/reply
+  answers sent to channels the bot can read but not post in raised an unhandled
+  `Forbidden` on every message. Sends are now gated by a `can_send` permission
+  check (which also skips the Claude call) and wrapped in a
+  `discord.HTTPException` guard.
+- **GIF links missed when wrapped or punctuated.** `extract_media` now strips
+  Discord's `<...>` wrapping and trailing punctuation before matching, so links
+  like `(https://tenor.com/...)` or `https://tenor.com/...).` are saved.
+
 ## [0.5.0] - 2026-09-14
 
 ### Added

@@ -31,11 +31,15 @@ Read this alongside `HOW_IT_WORKS.md`, which explains the *concepts*.
 
 ## 3. The message handler (`on_message`)
 
-- Ignores bots and DMs.
+- Ignores bots and DMs **first** — the guard runs before `state(guild)` is
+  touched, because a DM has no guild.
 - If a message @mentions the bot or replies to one of its messages, the active
   persona answers via `persona_answer` (Claude).
 - Otherwise it raises `heat` and, on a random roll, the bot chimes in as the
   selected persona via `spontaneous_reply`.
+- Every outbound send is gated by `can_send(...)` (a permission check) and
+  wrapped in a `discord.HTTPException` guard, so a channel the bot can read but
+  not post in no longer floods the log with 403 tracebacks.
 
 ## 4. The Markov core
 
@@ -44,7 +48,8 @@ Read this alongside `HOW_IT_WORKS.md`, which explains the *concepts*.
 - `generate_sentence(chain)` — walks the chain from a random pair, with two
   entropy tricks (unique-follower sampling and random vocabulary jumps) so it
   doesn't just parrot the source.
-- `extract_media(message)` — pulls Tenor/Giphy GIF links out of a message.
+- `extract_media(message)` — pulls Tenor/Giphy GIF links out of a message,
+  stripping Discord's `<...>` wrapping and trailing punctuation first.
 
 ## 5. Scanning (`/mimic`, `/servermimic`)
 
@@ -89,3 +94,7 @@ Read this alongside `HOW_IT_WORKS.md`, which explains the *concepts*.
 `on_tree_error` is the global hook for slash-command failures: it logs the real
 error to the terminal and replies with a friendly message, choosing between an
 initial response and a followup based on `response.is_done()`.
+
+Outbound sends in `on_message` are handled separately: `can_send` checks the
+bot's permissions and a `discord.HTTPException` guard swallows send failures,
+so read-only channels don't produce error spam.

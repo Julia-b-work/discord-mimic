@@ -189,11 +189,13 @@ async def on_ready():
 
 @client.event
 async def on_message(message):
-    g = state(message.guild)
-
-    # Ignore bots (prevents self-echo) and direct messages (no guild).
+    # Ignore bots (prevents self-echo) and direct messages (no guild). This
+    # guard must come first: a DM has no guild, so state(message.guild) below
+    # would raise AttributeError on a None guild id.
     if message.author.bot or message.guild is None:
         return
+
+    g = state(message.guild)
 
     # Nothing learned at all -> nothing to say.
     if not g["users"] and g["server"] is None:
@@ -216,9 +218,13 @@ async def on_message(message):
                 persona, question, message.channel.id, message.author.display_name
             )
         reply = f"**{persona['name']}**: {answer}"
-        await message.reply(
-            reply[:2000], allowed_mentions=discord.AllowedMentions.none()
-        )
+        try:
+            if can_send(message.channel):
+                await message.reply(
+                    reply[:2000], allowed_mentions=discord.AllowedMentions.none()
+                )
+        except discord.HTTPException:
+            pass
         g["heat"] = 0
         return
 
@@ -237,14 +243,24 @@ async def on_message(message):
         if persona is None:
             return
 
+        # Don't generate (or pay for a Claude call) if we can't post here.
+        if not can_send(message.channel):
+            return
+
         # 30% chance to re-send one of their saved images/GIFs instead of text.
         media = persona.get("media", [])
         if media and random.random() < 0.3:
-            await message.channel.send(random.choice(media))
+            try:
+                await message.channel.send(random.choice(media))
+            except discord.HTTPException:
+                pass
             return
 
         sentence = await spontaneous_reply(persona, message)
-        await message.channel.send(f"**{persona['name']}**: {sentence}")
+        try:
+            await message.channel.send(f"**{persona['name']}**: {sentence}")
+        except discord.HTTPException:
+            pass
 
 
 # Map each (word, word) pair to a list of words that follow it.
@@ -311,6 +327,9 @@ def extract_media(message):
     urls = []
 
     for word in message.content.split():
+        # Discord wraps URLs in <...> and punctuation often sticks to the ends
+        # ("(https://...)", "https://...)."): strip those before matching.
+        word = word.strip("<>()[]{}.,;:!?\"'")
         if word.startswith("http") and any(host in word for host in _GIF_HOSTS):
             urls.append(word)
 
@@ -864,6 +883,13 @@ async def what(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed)
 
 
+# True if the bot can actually send messages in a channel. Used before sending
+# to avoid 403 "Missing Permissions" tracebacks in channels where the bot can
+# read but not post (e.g. a read-only or restricted channel).
+def can_send(channel):
+    return channel.permissions_for(channel.guild.me).send_messages
+
+
 # Return the active persona dict (server or current user), or None.
 def active_persona(guild):
     g = state(guild)
@@ -1028,7 +1054,7 @@ async def on_tree_error(interaction: discord.Interaction, error):
 
 
 # Bumped on each release; see CHANGELOG.md for what changed.
-__version__ = "0.5.0"
+__version__ = "0.5.1"
 
 
 # Only connect to Discord when run directly (not when imported by tests).

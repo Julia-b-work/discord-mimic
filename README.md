@@ -7,7 +7,7 @@ with no AI dependencies; Claude layers on top so the persona can answer real
 questions (`/ask`), respond to mentions/replies, and even chime in on its own
 with context from recent messages.
 
-**Current version: 0.5.0** — see [CHANGELOG.md](CHANGELOG.md).
+**Current version: 0.5.1** — see [CHANGELOG.md](CHANGELOG.md).
 
 ## What it does
 

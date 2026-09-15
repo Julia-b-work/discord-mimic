@@ -127,6 +127,9 @@ important because a saved chain could theoretically be empty after a bad load.
 The bot mimics not just *words* but *media habits*. Tenor/Giphy links often
 appear as raw URLs in the message text; any "word" starting with "http" that
 contains a known GIF host (tenor.com, giphy.com, media.tenor.com) is captured.
+Discord wraps URLs in angle brackets and punctuation often sticks to either end
+(`(https://...)`, `https://...).`), so those characters are stripped before
+matching — otherwise the link would be silently missed.
 
 These URLs are saved with the user and later re-sent by /speak and the
 spontaneous message handler (a 30% chance whenever the bot would otherwise say
@@ -355,6 +358,10 @@ context (or Claude is unavailable) it falls back to a plain Markov sentence.
 Either way the reply is prefixed with the persona's name. There's still a 30%
 chance it re-sends one of the persona's saved GIFs instead of text.
 
+Before sending anything, the bot checks it can actually post in the channel
+(*can_send*) and skips the send (and the Claude call) if not. This stops a
+read-only-for-the-bot channel from producing a 403 traceback on every message.
+
 The design intent:
 
 - **Quiet chat stays quiet.** With heat at 1, the chance is only 6%.
@@ -379,6 +386,11 @@ must use a followup. The hook checks `response.is_done()` and picks accordingly,
 so the user actually sees the message in both cases.
 
 View callbacks (the channel picker) have a separate hook of their own — see §8.
+
+Outbound sends in `on_message` are guarded separately: `can_send` checks the
+bot's permissions first, and `discord.HTTPException` is caught, so a failed
+send in a read-only channel is skipped silently rather than logged as an
+unhandled exception.
 
 ---
 
